@@ -1,6 +1,14 @@
 {
   "string": [
     {
+      "name": "next_class_widget_name",
+      "value": "下一节课"
+    },
+    {
+      "name": "next_class_widget_description",
+      "value": "跟随当前课表，显示下一节课的开始倒计时、授课地点和教师"
+    },
+    {
       "name": "module_desc",
       "value": "HitaNEXT entry module"
     },
@@ -10,7 +18,15 @@
     },
     {
       "name": "EntryAbility_label",
-      "value": "HITA"
+      "value": "HITA NEXT"
+    },
+    {
+      "name": "calendar_read_reason",
+      "value": "用于检查已导出的课表日程，避免重复添加"
+    },
+    {
+      "name": "calendar_write_reason",
+      "value": "用于将课表课程和考试导出至手机日历"
     }
   ]
 }

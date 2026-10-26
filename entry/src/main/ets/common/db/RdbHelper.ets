@@ -14,13 +14,17 @@ import { relationalStore } from '@kit.ArkData';
 import {
   EasEventItem,
   EasEventType,
+  EasImportBaseEntry,
   EasSubjectColor,
   EasSubjectType,
   EasTermSubject,
-  EasTimeInDay,
   EasTimePeriodInDay,
   EasTimetable
 } from '../model/timetable/TimetableModels';
+import { TimetableBackup } from '../model/timetable/TimetableBackup';
+import { CourseDateSelection } from '../../feature/timetable/CourseDateSelection';
+import { normalizeHtmlSpaces } from '../util/HtmlSpaces';
+import { ScheduleChangeSignal } from '../util/ScheduleChangeSignal';
 
 // The first prototype shipped a different schema under this name.  Use a
 // versioned store so an upgrade cannot keep an incompatible old table layout.
@@ -43,11 +47,24 @@ const CREATE_EVENTS: string =
   'CREATE TABLE IF NOT EXISTS events (' +
   'id TEXT PRIMARY KEY, type TEXT NOT NULL, name TEXT NOT NULL, place TEXT, teacher TEXT, ' +
   'subjectId TEXT NOT NULL, timetableId TEXT NOT NULL, fromTime INTEGER NOT NULL, toTime INTEGER NOT NULL, ' +
-  'fromNumber INTEGER NOT NULL, lastNumber INTEGER NOT NULL, createdAt INTEGER NOT NULL)';
+  'fromNumber INTEGER NOT NULL, lastNumber INTEGER NOT NULL, createdAt INTEGER NOT NULL, ' +
+  'color INTEGER NOT NULL DEFAULT 0)';
+
+/**
+ * 每张教务课表上次导入或更新时的教务版本，用来区分教务端变化与用户自己的修改。
+ * 不设唯一约束：调整开学日期时整表平移，逐行检查唯一性会在中途误报冲突。
+ */
+const CREATE_IMPORT_BASE: string =
+  'CREATE TABLE IF NOT EXISTS import_base (' +
+  'timetableId TEXT NOT NULL, name TEXT NOT NULL, fromTime INTEGER NOT NULL, toTime INTEGER NOT NULL, ' +
+  'signature TEXT NOT NULL)';
+
+const CREATE_BACKUP_RECEIPT: string = 'CREATE TABLE IF NOT EXISTS backup_restore_receipt (id TEXT PRIMARY KEY)';
 
 export class RdbHelper {
   private static instance: RdbHelper | undefined = undefined;
   private store: relationalStore.RdbStore | undefined = undefined;
+  private initializing: Promise<void> | undefined = undefined;
 
   static getInstance(): RdbHelper {
     if (RdbHelper.instance === undefined) {
@@ -57,9 +74,25 @@ export class RdbHelper {
   }
 
   async init(context: common.Context): Promise<void> {
+    if (this.initializing !== undefined) {
+      await this.initializing;
+      return;
+    }
     if (this.store !== undefined) {
       return;
     }
+    this.initializing = this.openStore(context);
+    try {
+      await this.initializing;
+    } catch (e) {
+      this.store = undefined;
+      throw new Error(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.initializing = undefined;
+    }
+  }
+
+  private async openStore(context: common.Context): Promise<void> {
     const config: relationalStore.StoreConfig = {
       name: DB_NAME,
       securityLevel: relationalStore.SecurityLevel.S1
@@ -72,7 +105,30 @@ export class RdbHelper {
     await this.execSql(CREATE_TIMETABLE);
     await this.execSql(CREATE_SUBJECT);
     await this.execSql(CREATE_EVENTS);
+    await this.execSql(CREATE_IMPORT_BASE);
+    await this.execSql(CREATE_BACKUP_RECEIPT);
+    await this.ensureEventColorColumn();
     await this.repairLegacyWeihaiTimetables();
+    await this.repairLegacyBenbuTimetables();
+    await this.repairLegacyImportedWeeks();
+  }
+
+  private async ensureEventColorColumn(): Promise<void> {
+    const columns: relationalStore.ResultSet = await this.s().querySql('PRAGMA table_info(events)');
+    let hasColor: boolean = false;
+    try {
+      while (columns.goToNextRow()) {
+        if (columns.getString(columns.getColumnIndex('name')) === 'color') {
+          hasColor = true;
+          break;
+        }
+      }
+    } finally {
+      columns.close();
+    }
+    if (!hasColor) {
+      await this.execSql('ALTER TABLE events ADD COLUMN color INTEGER NOT NULL DEFAULT 0');
+    }
   }
 
   private s(): relationalStore.RdbStore {
@@ -86,6 +142,7 @@ export class RdbHelper {
   private async del(pred: relationalStore.RdbPredicates): Promise<void> {
     try {
       await this.s().delete(pred);
+      ScheduleChangeSignal.notify();
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'delete failed %{public}s', String(e));
       throw new Error(String(e));
@@ -98,6 +155,7 @@ export class RdbHelper {
       if (rowId < 0) {
         throw new Error('insert returned ' + rowId.toString());
       }
+      ScheduleChangeSignal.notify();
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'insert table=%{public}s failed %{public}s', table, String(e));
       throw new Error(String(e));
@@ -107,6 +165,7 @@ export class RdbHelper {
   private async upd(values: relationalStore.ValuesBucket, pred: relationalStore.RdbPredicates): Promise<void> {
     try {
       await this.s().update(values, pred);
+      ScheduleChangeSignal.notify();
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'update failed %{public}s', String(e));
       throw new Error(String(e));
@@ -145,8 +204,34 @@ export class RdbHelper {
 
   private async replaceRow(table: string, bucket: relationalStore.ValuesBucket, pkColumn: string,
     pkValue: string): Promise<void> {
-    await this.del(new relationalStore.RdbPredicates(table).equalTo(pkColumn, pkValue));
-    await this.ins(table, bucket);
+    await this.writeTransaction(async (transaction: relationalStore.Transaction): Promise<void> => {
+      await RdbHelper.upsertRow(transaction, table, bucket, pkColumn, pkValue);
+    });
+  }
+
+  private async writeTransaction(action: (transaction: relationalStore.Transaction) => Promise<void>): Promise<void> {
+    const transaction: relationalStore.Transaction = await this.s().createTransaction();
+    try {
+      await action(transaction);
+      await transaction.commit();
+      ScheduleChangeSignal.notify();
+    } catch (error) {
+      try { await transaction.rollback(); } catch (_) {}
+      throw new Error(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private static async upsertRow(transaction: relationalStore.Transaction, table: string,
+    bucket: relationalStore.ValuesBucket, pkColumn: string, pkValue: string): Promise<void> {
+    const predicate: relationalStore.RdbPredicates = new relationalStore.RdbPredicates(table).equalTo(pkColumn, pkValue);
+    const rows: relationalStore.ResultSet = await transaction.query(predicate, [pkColumn]);
+    let exists: boolean = false;
+    try { exists = rows.goToFirstRow(); } finally { rows.close(); }
+    if (exists) {
+      if (await transaction.update(bucket, predicate) !== 1) throw new Error('Record update failed');
+    } else if (await transaction.insert(table, bucket) < 0) {
+      throw new Error('Record insert failed');
+    }
   }
 
   /** 修复早期版本把威海误存为本部作息的本地课表。 */
@@ -179,16 +264,74 @@ export class RdbHelper {
     }
   }
 
+  /** Correct only untouched legacy Benbu course times, atomically with their bell schedule. */
+  private async repairLegacyBenbuTimetables(): Promise<void> {
+    const timetables: EasTimetable[] = await this.getTimetables();
+    for (const timetable of timetables) {
+      if (!timetable.code.startsWith('BENBU:') || !RdbHelper.isLegacyBenbuSchedule(timetable)) continue;
+      await this.writeTransaction(async (transaction: relationalStore.Transaction): Promise<void> => {
+        const predicate: relationalStore.RdbPredicates = new relationalStore.RdbPredicates('timetable')
+          .equalTo('id', timetable.id).equalTo('code', timetable.code);
+        const rows: relationalStore.ResultSet = await transaction.query(predicate, ['scheduleStructure']);
+        try {
+          if (!rows.goToFirstRow()) return;
+          timetable.scheduleStructure = EasTimetable.decodeStructure(rows.getString(rows.getColumnIndex('scheduleStructure')));
+        } finally { rows.close(); }
+        if (!RdbHelper.isLegacyBenbuSchedule(timetable)) return;
+        const previous: EasTimePeriodInDay[] = timetable.scheduleStructure;
+        const correct: EasTimePeriodInDay[] = EasTimetable.getBenbuTimeStructure();
+        const events: EasEventItem[] = RdbHelper.readRows(await transaction.query(
+          new relationalStore.RdbPredicates('events').equalTo('timetableId', timetable.id)
+            .equalTo('type', EasEventType.CLASS)), RdbHelper.eventMapper);
+        for (const event of events) {
+          if (!Number.isInteger(event.fromNumber) || !Number.isInteger(event.lastNumber) ||
+            event.fromNumber < 1 || event.lastNumber < event.fromNumber || event.lastNumber > correct.length ||
+            !Number.isFinite(event.from) || !Number.isFinite(event.to)) continue;
+          const date: Date = new Date(event.from);
+          const dayStart: number = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+          if (event.from !== dayStart + previous[event.fromNumber - 1].from.toMills() ||
+            event.to !== dayStart + previous[event.lastNumber - 1].to.toMills()) continue;
+          await transaction.update({
+            fromTime: dayStart + correct[event.fromNumber - 1].from.toMills(),
+            toTime: dayStart + correct[event.lastNumber - 1].to.toMills()
+          }, new relationalStore.RdbPredicates('events').equalTo('id', event.id));
+        }
+        await transaction.update({
+          scheduleStructure: EasTimetable.encodeStructure(correct)
+        }, predicate);
+      });
+    }
+  }
+
+  private async repairLegacyImportedWeeks(): Promise<void> {
+    const timetables = await this.getTimetables();
+    for (const timetable of timetables) {
+      if (timetable.code.length === 0 || timetable.endTime !== timetable.startTime + 25 * 7 * 86400000) continue;
+      const events = await this.getEventsOfTimetable(timetable.id);
+      const endTime = CourseDateSelection.repairedImportedEnd(timetable, events);
+      if (endTime !== timetable.endTime) {
+        await this.upd({ 'endTime': endTime }, new relationalStore.RdbPredicates('timetable')
+          .equalTo('id', timetable.id).equalTo('endTime', timetable.endTime));
+      }
+    }
+  }
+
   private static isLegacyBenbuSchedule(timetable: EasTimetable): boolean {
     if (timetable.scheduleStructure.length !== 12) {
       return false;
     }
-    const first: EasTimePeriodInDay = timetable.scheduleStructure[0];
-    const sixth: EasTimePeriodInDay = timetable.scheduleStructure[5];
-    const seventh: EasTimePeriodInDay = timetable.scheduleStructure[6];
-    return first.from.equals(new EasTimeInDay(8, 0)) && first.to.equals(new EasTimeInDay(8, 50)) &&
-      sixth.from.equals(new EasTimeInDay(14, 25)) && sixth.to.equals(new EasTimeInDay(15, 15)) &&
-      seventh.from.equals(new EasTimeInDay(15, 25)) && seventh.to.equals(new EasTimeInDay(16, 15));
+    const legacy: number[][] = [
+      [8, 0, 8, 50], [8, 55, 9, 45], [10, 5, 10, 55], [11, 0, 11, 50],
+      [13, 30, 14, 20], [14, 25, 15, 15], [15, 25, 16, 15], [16, 20, 17, 10],
+      [17, 20, 18, 10], [18, 30, 19, 20], [19, 30, 20, 20], [20, 30, 21, 20]
+    ];
+    for (let i: number = 0; i < legacy.length; i++) {
+      const period: EasTimePeriodInDay = timetable.scheduleStructure[i];
+      const old: number[] = legacy[i];
+      if (period.from.hour !== old[0] || period.from.minute !== old[1] ||
+        period.to.hour !== old[2] || period.to.minute !== old[3]) return false;
+    }
+    return true;
   }
 
   // ------------------------------------------------------------------
@@ -196,7 +339,11 @@ export class RdbHelper {
   // ------------------------------------------------------------------
 
   async saveTimetable(t: EasTimetable): Promise<void> {
-    const b: relationalStore.ValuesBucket = {
+    await this.replaceRow('timetable', RdbHelper.timetableValues(t), 'id', t.id);
+  }
+
+  private static timetableValues(t: EasTimetable): relationalStore.ValuesBucket {
+    return {
       'id': t.id,
       'name': t.name,
       'code': t.code,
@@ -205,7 +352,172 @@ export class RdbHelper {
       'createdAt': t.createdAt,
       'scheduleStructure': EasTimetable.encodeStructure(t.scheduleStructure)
     };
-    await this.replaceRow('timetable', b, 'id', t.id);
+  }
+
+  /**
+   * Publish a complete import together; re-importing courses must retain exams and other events.
+   * The school version of the imported classes becomes the base for later merge updates.
+   */
+  async saveImportedTimetable(timetable: EasTimetable, subjects: EasTermSubject[], events: EasEventItem[],
+    replaceCourses: boolean, base: EasImportBaseEntry[] = []): Promise<void> {
+    if (timetable.id.length === 0 || !Number.isFinite(timetable.startTime) ||
+      !Number.isFinite(timetable.endTime) || timetable.endTime <= timetable.startTime || events.length === 0 ||
+      subjects.some((subject: EasTermSubject): boolean => subject.timetableId !== timetable.id) ||
+      events.some((event: EasEventItem): boolean => event.timetableId !== timetable.id ||
+        !Number.isFinite(event.from) || !Number.isFinite(event.to) || event.to <= event.from ||
+        (replaceCourses && event.type !== EasEventType.CLASS))) {
+      throw new Error('Invalid timetable import');
+    }
+    let finalEnd: number = timetable.endTime;
+    await this.writeTransaction(async (transaction: relationalStore.Transaction): Promise<void> => {
+      if (replaceCourses) {
+        const changed: number = await transaction.update(RdbHelper.timetableValues(timetable),
+          new relationalStore.RdbPredicates('timetable').equalTo('id', timetable.id));
+        if (changed !== 1) throw new Error('Timetable no longer exists');
+        await transaction.delete(new relationalStore.RdbPredicates('events')
+          .equalTo('timetableId', timetable.id).equalTo('type', EasEventType.CLASS));
+      } else if (await transaction.insert('timetable', RdbHelper.timetableValues(timetable)) < 0) {
+        throw new Error('Timetable insert failed');
+      }
+      for (const subject of subjects) {
+        await RdbHelper.upsertRow(transaction, 'subject', RdbHelper.subjectValues(subject), 'id', subject.id);
+      }
+      for (const event of events) {
+        if (await transaction.insert('events', RdbHelper.eventValues(event)) < 0) {
+          throw new Error('Event insert failed');
+        }
+      }
+      if (base.length > 0) {
+        await RdbHelper.replaceImportBase(transaction, timetable.id, base);
+      }
+      // Retained exams or reminders can extend beyond the imported teaching weeks.
+      const last: relationalStore.ResultSet = await transaction.query(
+        new relationalStore.RdbPredicates('events').equalTo('timetableId', timetable.id)
+          .orderByDesc('toTime').limitAs(1), ['toTime']);
+      try {
+        if (last.goToFirstRow()) {
+          finalEnd = Math.max(finalEnd, CourseDateSelection.weekEnd(last.getLong(last.getColumnIndex('toTime'))));
+        }
+      } finally { last.close(); }
+      if (finalEnd !== timetable.endTime) {
+        await transaction.update({ endTime: finalEnd },
+          new relationalStore.RdbPredicates('timetable').equalTo('id', timetable.id));
+      }
+    });
+    timetable.endTime = finalEnd;
+  }
+
+  /** 上次导入或更新时的教务版本；旧版本导入、还没有记录时为空。 */
+  async getImportBase(timetableId: string): Promise<EasImportBaseEntry[]> {
+    const rows: relationalStore.ResultSet = await this.s().query(
+      new relationalStore.RdbPredicates('import_base').equalTo('timetableId', timetableId),
+      ['name', 'fromTime', 'toTime', 'signature']);
+    const out: EasImportBaseEntry[] = [];
+    try {
+      while (rows.goToNextRow()) {
+        out.push(new EasImportBaseEntry(rows.getString(rows.getColumnIndex('name')),
+          rows.getLong(rows.getColumnIndex('fromTime')), rows.getLong(rows.getColumnIndex('toTime')),
+          rows.getString(rows.getColumnIndex('signature'))));
+      }
+    } finally {
+      rows.close();
+    }
+    return out;
+  }
+
+  async saveImportBase(timetableId: string, base: EasImportBaseEntry[]): Promise<void> {
+    await this.writeTransaction(async (transaction: relationalStore.Transaction): Promise<void> => {
+      await RdbHelper.replaceImportBase(transaction, timetableId, base);
+    });
+  }
+
+  /**
+   * 合并更新：逐条新增、修改、删除课程并记录新的教务基准，整体在一个事务里完成。
+   * 只动合并结果点名的课次；用户翘过、改过、添加的课，考试等其他日程和已有科目都不动。
+   */
+  async applyTimetableMerge(timetableId: string, newSubjects: EasTermSubject[], inserts: EasEventItem[],
+    updates: EasEventItem[], deletes: EasEventItem[], base: EasImportBaseEntry[]): Promise<void> {
+    if (newSubjects.some((subject: EasTermSubject): boolean => subject.timetableId !== timetableId) ||
+      inserts.concat(updates).some((event: EasEventItem): boolean => event.timetableId !== timetableId ||
+        event.type !== EasEventType.CLASS || !Number.isFinite(event.from) || !Number.isFinite(event.to) ||
+        event.to <= event.from)) {
+      throw new Error('Invalid timetable merge');
+    }
+    await this.writeTransaction(async (transaction: relationalStore.Transaction): Promise<void> => {
+      const table: relationalStore.ResultSet = await transaction.query(
+        new relationalStore.RdbPredicates('timetable').equalTo('id', timetableId), ['endTime']);
+      let currentEnd: number = 0;
+      try {
+        if (!table.goToFirstRow()) throw new Error('Timetable no longer exists');
+        currentEnd = table.getLong(table.getColumnIndex('endTime'));
+      } finally { table.close(); }
+      for (const subject of newSubjects) {
+        if (await transaction.insert('subject', RdbHelper.subjectValues(subject)) < 0) {
+          throw new Error('Subject insert failed');
+        }
+      }
+      for (const event of inserts) {
+        if (await transaction.insert('events', RdbHelper.eventValues(event)) < 0) {
+          throw new Error('Event insert failed');
+        }
+      }
+      for (const event of updates) {
+        const changed: number = await transaction.update(RdbHelper.eventValues(event),
+          new relationalStore.RdbPredicates('events').equalTo('id', event.id)
+            .equalTo('timetableId', timetableId).equalTo('type', EasEventType.CLASS));
+        if (changed !== 1) throw new Error('Course changed during update');
+      }
+      for (const event of deletes) {
+        await transaction.delete(new relationalStore.RdbPredicates('events').equalTo('id', event.id)
+          .equalTo('timetableId', timetableId).equalTo('type', EasEventType.CLASS));
+      }
+      await RdbHelper.replaceImportBase(transaction, timetableId, base);
+      const lastEnd: number = inserts.reduce((end: number, event: EasEventItem): number =>
+        Math.max(end, event.to), currentEnd);
+      if (lastEnd > currentEnd) {
+        const updated: number = await transaction.update({ 'endTime': CourseDateSelection.weekEnd(lastEnd) },
+          new relationalStore.RdbPredicates('timetable').equalTo('id', timetableId));
+        if (updated !== 1) throw new Error('Timetable update failed');
+      }
+    });
+  }
+
+  private static async replaceImportBase(transaction: relationalStore.Transaction, timetableId: string,
+    base: EasImportBaseEntry[]): Promise<void> {
+    await transaction.delete(new relationalStore.RdbPredicates('import_base').equalTo('timetableId', timetableId));
+    for (const entry of base) {
+      const row: relationalStore.ValuesBucket = {
+        'timetableId': timetableId,
+        'name': entry.name,
+        'fromTime': entry.from,
+        'toTime': entry.to,
+        'signature': entry.signature
+      };
+      if (await transaction.insert('import_base', row) < 0) {
+        throw new Error('Import base insert failed');
+      }
+    }
+  }
+
+  /** Move the term and every occurrence in one transaction; reject an outdated editor. */
+  async shiftTimetableStart(id: string, previousStart: number, previousEnd: number, nextStart: number): Promise<void> {
+    if (id.length === 0 || !Number.isFinite(previousStart) || !Number.isFinite(previousEnd) ||
+      !Number.isFinite(nextStart) || nextStart <= 0 || previousEnd < previousStart) {
+      throw new Error('Invalid timetable date');
+    }
+    const delta: number = nextStart - EasTimetable.mondayMsOf(previousStart);
+    const nextEnd: number = nextStart + Math.max(86400000, previousEnd - previousStart);
+    await this.writeTransaction(async (transaction: relationalStore.Transaction): Promise<void> => {
+      const changed: number = await transaction.update({ startTime: nextStart, endTime: nextEnd },
+        new relationalStore.RdbPredicates('timetable').equalTo('id', id)
+          .equalTo('startTime', previousStart).equalTo('endTime', previousEnd));
+      if (changed !== 1) throw new Error('Timetable changed; reload before editing');
+      await transaction.execute(
+        'UPDATE events SET fromTime = fromTime + ?, toTime = toTime + ? WHERE timetableId = ?', [delta, delta, id]);
+      // 教务基准随课次一起平移，否则下次检查会把整学期误当作教务端变化。
+      await transaction.execute(
+        'UPDATE import_base SET fromTime = fromTime + ?, toTime = toTime + ? WHERE timetableId = ?', [delta, delta, id]);
+    });
   }
 
   /** 按 -startTime 排序的全量课表。 */
@@ -213,23 +525,13 @@ export class RdbHelper {
     const pred: relationalStore.RdbPredicates = new relationalStore.RdbPredicates('timetable');
     pred.orderByDesc('startTime');
     const rs: relationalStore.ResultSet | null = await this.qry(pred);
-    return RdbHelper.readRows(rs, (col: (name: string) => ValueGetter) => {
-      const t: EasTimetable = new EasTimetable();
-      t.id = col('id').str();
-      t.name = col('name').str();
-      t.code = col('code').str();
-      t.startTime = col('startTime').num();
-      t.endTime = col('endTime').num();
-      t.createdAt = col('createdAt').num();
-      t.scheduleStructure = EasTimetable.decodeStructure(col('scheduleStructure').str());
-      return t;
-    });
+    return RdbHelper.readRows(rs, RdbHelper.timetableMapper);
   }
 
-  async getTimetableById(id: string): Promise<EasTimetable | undefined> {
+  async getTimetableById(id: string, strict: boolean = false): Promise<EasTimetable | undefined> {
     const pred: relationalStore.RdbPredicates = new relationalStore.RdbPredicates('timetable');
     pred.equalTo('id', id);
-    return RdbHelper.firstRow(await this.qry(pred), (col: (name: string) => ValueGetter) => {
+    return RdbHelper.firstRow(await (strict ? this.s().query(pred) : this.qry(pred)), (col: (name: string) => ValueGetter) => {
       const t: EasTimetable = new EasTimetable();
       t.id = col('id').str();
       t.name = col('name').str();
@@ -239,7 +541,7 @@ export class RdbHelper {
       t.createdAt = col('createdAt').num();
       t.scheduleStructure = EasTimetable.decodeStructure(col('scheduleStructure').str());
       return t;
-    });
+    }, strict);
   }
 
   async getTimetableByEasCode(easCode: string): Promise<EasTimetable | undefined> {
@@ -272,9 +574,12 @@ export class RdbHelper {
     if (ids.length === 0) {
       return;
     }
-    await this.del(new relationalStore.RdbPredicates('events').in('timetableId', ids));
-    await this.del(new relationalStore.RdbPredicates('subject').in('timetableId', ids));
-    await this.deleteTimetablesInIds(ids);
+    await this.writeTransaction(async (transaction: relationalStore.Transaction): Promise<void> => {
+      await transaction.delete(new relationalStore.RdbPredicates('events').in('timetableId', ids));
+      await transaction.delete(new relationalStore.RdbPredicates('subject').in('timetableId', ids));
+      await transaction.delete(new relationalStore.RdbPredicates('import_base').in('timetableId', ids));
+      await transaction.delete(new relationalStore.RdbPredicates('timetable').in('id', ids));
+    });
   }
 
   // ------------------------------------------------------------------
@@ -282,7 +587,22 @@ export class RdbHelper {
   // ------------------------------------------------------------------
 
   async saveSubject(s: EasTermSubject): Promise<void> {
-    const b: relationalStore.ValuesBucket = {
+    await this.replaceRow('subject', RdbHelper.subjectValues(s), 'id', s.id);
+  }
+
+  async saveSubjectType(id: string, timetableId: string, type: EasSubjectType): Promise<void> {
+    if (id.length === 0 || timetableId.length === 0) {
+      throw new Error('Missing course identity');
+    }
+    const changed: number = await this.s().update({ 'type': type.toString() },
+      new relationalStore.RdbPredicates('subject').equalTo('id', id).equalTo('timetableId', timetableId));
+    if (changed !== 1) {
+      throw new Error('Course no longer exists');
+    }
+  }
+
+  private static subjectValues(s: EasTermSubject): relationalStore.ValuesBucket {
+    return {
       'id': s.id,
       'timetableId': s.timetableId,
       'name': s.name,
@@ -296,7 +616,6 @@ export class RdbHelper {
       'createdAt': s.createdAt,
       'color': s.color
     };
-    await this.replaceRow('subject', b, 'id', s.id);
   }
 
   /** 某课表科目，按 credit 降序（对应 SubjectDao.getSubjects）。 */
@@ -304,23 +623,17 @@ export class RdbHelper {
     const pred: relationalStore.RdbPredicates = new relationalStore.RdbPredicates('subject');
     pred.equalTo('timetableId', timetableId);
     pred.orderByDesc('credit');
+    return this.readSubjects(pred);
+  }
+
+  /** Credit statistics aggregate all saved timetables, with deduplication in the credit feature. */
+  async getAllSubjects(): Promise<EasTermSubject[]> {
+    return this.readSubjects(new relationalStore.RdbPredicates('subject').orderByDesc('createdAt'));
+  }
+
+  private async readSubjects(pred: relationalStore.RdbPredicates): Promise<EasTermSubject[]> {
     const rs: relationalStore.ResultSet | null = await this.qry(pred);
-    return RdbHelper.readRows(rs, (col: (name: string) => ValueGetter) => {
-      const s: EasTermSubject = new EasTermSubject();
-      s.id = col('id').str();
-      s.timetableId = col('timetableId').str();
-      s.name = col('name').str();
-      s.type = RdbHelper.subjectTypeOf(col('type').str());
-      s.field = col('field').str();
-      s.credit = col('credit').numD();
-      s.school = col('school').str();
-      s.countInSPA = col('countInSPA').num() !== 0;
-      s.code = col('code').str();
-      s.key = col('key').str();
-      s.createdAt = col('createdAt').num();
-      s.color = col('color').num();
-      return s;
-    });
+    return RdbHelper.readRows(rs, RdbHelper.subjectMapper);
   }
 
   /** 指定科目 id 的 (id,color) 投影（对应 SubjectDao.getSubjectColorsWithId）。 */
@@ -336,6 +649,18 @@ export class RdbHelper {
     });
   }
 
+  /** Save the subject color; propagate failures so the editor cannot report a false success. */
+  async saveCourseColor(id: string, timetableId: string, color: number): Promise<void> {
+    if (id.length === 0 || timetableId.length === 0) {
+      throw new Error('Missing course identity');
+    }
+    const changed: number = await this.s().update({ 'color': color },
+      new relationalStore.RdbPredicates('subject').equalTo('id', id).equalTo('timetableId', timetableId));
+    if (changed !== 1) {
+      throw new Error('Course no longer exists');
+    }
+  }
+
   async changeSubjectColor(id: string, color: number): Promise<void> {
     await this.upd({ 'color': color },
       new relationalStore.RdbPredicates('subject').equalTo('id', id));
@@ -346,7 +671,136 @@ export class RdbHelper {
   // ------------------------------------------------------------------
 
   async saveEvent(e: EasEventItem): Promise<void> {
-    const b: relationalStore.ValuesBucket = {
+    await this.replaceRow('events', RdbHelper.eventValues(e), 'id', e.id);
+  }
+
+  /** Save all selected course occurrences together; failures leave no partial course behind. */
+  async saveCourseOccurrences(subject: EasTermSubject, events: EasEventItem[], newSubject: boolean): Promise<void> {
+    if (events.length === 0 || events.some((event: EasEventItem): boolean =>
+      event.type !== EasEventType.CLASS || event.subjectId !== subject.id ||
+      event.timetableId !== subject.timetableId || event.to <= event.from)) {
+      throw new Error('Invalid course occurrences');
+    }
+    const transaction: relationalStore.Transaction = await this.s().createTransaction();
+    try {
+      const table: relationalStore.ResultSet = await transaction.query(
+        new relationalStore.RdbPredicates('timetable').equalTo('id', subject.timetableId), ['startTime', 'endTime']);
+      let currentEnd: number = 0;
+      let currentStart: number = 0;
+      try {
+        if (!table.goToFirstRow()) throw new Error('Timetable no longer exists');
+        currentStart = table.getLong(table.getColumnIndex('startTime'));
+        currentEnd = table.getLong(table.getColumnIndex('endTime'));
+      } finally { table.close(); }
+      if (events.some((event: EasEventItem): boolean => event.from < EasTimetable.mondayMsOf(currentStart))) {
+        throw new Error('Course predates timetable');
+      }
+      if (newSubject) await transaction.insert('subject', RdbHelper.subjectValues(subject));
+      for (const event of events) {
+        await transaction.insert('events', RdbHelper.eventValues(event));
+      }
+      const lastEnd: number = events.reduce((end: number, event: EasEventItem): number => Math.max(end, event.to), currentEnd);
+      if (lastEnd > currentEnd) {
+        const updated: number = await transaction.update({ 'endTime': CourseDateSelection.weekEnd(lastEnd) },
+          new relationalStore.RdbPredicates('timetable').equalTo('id', subject.timetableId));
+        if (updated !== 1) throw new Error('Timetable update failed');
+      }
+      await transaction.commit();
+    } catch (error) {
+      try { await transaction.rollback(); } catch (_) {}
+      throw new Error('课程未保存，请重试');
+    }
+    ScheduleChangeSignal.notify();
+  }
+
+  /** Exam colors belong to individual events, never to their linked course. */
+  async saveExamColor(id: string, timetableId: string, color: number): Promise<void> {
+    if (id.length === 0 || timetableId.length === 0) {
+      throw new Error('Missing exam identity');
+    }
+    const changed: number = await this.s().update({ 'color': color },
+      new relationalStore.RdbPredicates('events').equalTo('id', id)
+        .equalTo('timetableId', timetableId).equalTo('type', EasEventType.EXAM));
+    if (changed !== 1) {
+      throw new Error('Exam no longer exists');
+    }
+  }
+
+  /** Atomic reschedule, cancellation and undo, guarded by the original occurrence snapshot. */
+  async replaceCourseOccurrences(before: EasEventItem[], after: EasEventItem[], timetableId: string): Promise<void> {
+    if (timetableId.length === 0 || (before.length === 0 && after.length === 0)) throw new Error('Missing course identity');
+    const all: EasEventItem[] = before.concat(after);
+    if (all.some((item: EasEventItem): boolean => item.type !== EasEventType.CLASS ||
+      item.timetableId !== timetableId || item.id.length === 0)) throw new Error('Invalid course scope');
+    if (new Set(before.map((item: EasEventItem): string => item.id)).size !== before.length ||
+      new Set(after.map((item: EasEventItem): string => item.id)).size !== after.length) throw new Error('Duplicate occurrence');
+    await this.writeTransaction(async (transaction: relationalStore.Transaction): Promise<void> => {
+      const tables: relationalStore.ResultSet = await transaction.query(
+        new relationalStore.RdbPredicates('timetable').equalTo('id', timetableId), ['endTime']);
+      let endTime: number = 0;
+      try {
+        if (!tables.goToFirstRow()) throw new Error('Timetable no longer exists');
+        endTime = tables.getLong(tables.getColumnIndex('endTime'));
+      } finally { tables.close(); }
+      // Check the complete snapshot before any write, including undo. Reject concurrent edits.
+      for (const item of before) {
+        const rows: relationalStore.ResultSet = await transaction.query(
+          new relationalStore.RdbPredicates('events').equalTo('id', item.id).equalTo('timetableId', timetableId));
+        const current: EasEventItem | undefined = RdbHelper.firstRow(rows, RdbHelper.eventMapper);
+        if (current === undefined || current.type !== item.type || current.subjectId !== item.subjectId ||
+          current.from !== item.from || current.to !== item.to || current.name !== item.name ||
+          current.place !== item.place || current.teacher !== item.teacher || current.color !== item.color ||
+          current.fromNumber !== item.fromNumber || current.lastNumber !== item.lastNumber) {
+          throw new Error('Course changed; refresh before editing');
+        }
+      }
+      for (const item of before) {
+        if (!after.some((next: EasEventItem): boolean => next.id === item.id)) {
+          await transaction.delete(new relationalStore.RdbPredicates('events')
+            .equalTo('id', item.id).equalTo('timetableId', timetableId));
+        }
+      }
+      for (const item of after) {
+        if (item.to <= item.from) throw new Error('Invalid course time');
+        const existing: boolean = before.some((previous: EasEventItem): boolean => previous.id === item.id);
+        if (existing) {
+          const values: relationalStore.ValuesBucket = RdbHelper.eventValues(item);
+          if (await transaction.update(values, new relationalStore.RdbPredicates('events')
+            .equalTo('id', item.id).equalTo('timetableId', timetableId)) !== 1) throw new Error('Course update failed');
+        } else {
+          const subjects: relationalStore.ResultSet = await transaction.query(
+            new relationalStore.RdbPredicates('subject').equalTo('id', item.subjectId).equalTo('timetableId', timetableId), ['id']);
+          try { if (!subjects.goToFirstRow()) throw new Error('Subject no longer exists'); } finally { subjects.close(); }
+          const duplicates: relationalStore.ResultSet = await transaction.query(
+            new relationalStore.RdbPredicates('events').equalTo('id', item.id), ['id']);
+          try { if (duplicates.goToFirstRow()) throw new Error('Occurrence already exists'); } finally { duplicates.close(); }
+          if (await transaction.insert('events', RdbHelper.eventValues(item)) < 0) throw new Error('Course restore failed');
+        }
+      }
+      let lastEnd: number = endTime;
+      for (const item of after) lastEnd = Math.max(lastEnd, item.to);
+      if (lastEnd > endTime) await transaction.update({ endTime: CourseDateSelection.weekEnd(lastEnd) },
+        new relationalStore.RdbPredicates('timetable').equalTo('id', timetableId));
+    });
+  }
+
+  /** Edit in place: failed writes must not remove or recreate an existing event. */
+  async updateEvent(e: EasEventItem): Promise<void> {
+    try {
+      const count: number = await this.s().update(RdbHelper.eventValues(e),
+        new relationalStore.RdbPredicates('events').equalTo('id', e.id));
+      if (count !== 1) {
+        throw new Error('Event no longer exists');
+      }
+      ScheduleChangeSignal.notify();
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'update event failed %{public}s', String(e));
+      throw new Error(String(e));
+    }
+  }
+
+  private static eventValues(e: EasEventItem): relationalStore.ValuesBucket {
+    return {
       'id': e.id,
       'type': e.type.toString(),
       'name': e.name,
@@ -358,9 +812,9 @@ export class RdbHelper {
       'toTime': e.to,
       'fromNumber': e.fromNumber,
       'lastNumber': e.lastNumber,
-      'createdAt': e.createdAt
+      'createdAt': e.createdAt,
+      'color': e.type === EasEventType.EXAM ? e.color : 0
     };
-    await this.replaceRow('events', b, 'id', e.id);
   }
 
   /** 区间内事件（对应 getEventsDuringSync：from/to 四向包含）。 */
@@ -382,11 +836,11 @@ export class RdbHelper {
   }
 
   /** 某课表全部事件（对应 getEventsOfTimetableSync）。 */
-  async getEventsOfTimetable(timetableId: string): Promise<EasEventItem[]> {
+  async getEventsOfTimetable(timetableId: string, strict: boolean = false): Promise<EasEventItem[]> {
     const pred: relationalStore.RdbPredicates = new relationalStore.RdbPredicates('events');
     pred.equalTo('timetableId', timetableId);
     pred.orderByAsc('fromTime');
-    return RdbHelper.readRows(await this.qry(pred), RdbHelper.eventMapper);
+    return RdbHelper.readRows(await (strict ? this.s().query(pred) : this.qry(pred)), RdbHelper.eventMapper, strict);
   }
 
   async getClassesOfSubject(subjectId: string): Promise<EasEventItem[]> {
@@ -416,9 +870,50 @@ export class RdbHelper {
     await this.del(new relationalStore.RdbPredicates('events').equalTo('id', id));
   }
 
+  /** Remove only the occurrences represented by one timetable card, never its subject or exams. */
+  async deleteClassOccurrences(ids: string[], timetableId: string): Promise<void> {
+    if (ids.length === 0 || ids.some((id: string): boolean => id.length === 0) || timetableId.length === 0) {
+      throw new Error('Missing class occurrence identity');
+    }
+    const removed: number = await this.s().delete(new relationalStore.RdbPredicates('events')
+      .equalTo('timetableId', timetableId).equalTo('type', EasEventType.CLASS).in('id', ids));
+    if (removed === 0) {
+      throw new Error('Class occurrence no longer exists');
+    }
+    ScheduleChangeSignal.notify();
+  }
+
   /** 删除某科目全部课程事件。 */
   async deleteEventsOfSubject(subjectId: string): Promise<void> {
     await this.del(new relationalStore.RdbPredicates('events').equalTo('subjectId', subjectId));
+  }
+
+  /** 原子删除一门课程及其课时；关联考试由考试管理独立维护。 */
+  async deleteCourseWithClasses(subjectId: string, timetableId: string): Promise<void> {
+    if (subjectId.length === 0 || timetableId.length === 0) {
+      throw new Error('Missing course identity');
+    }
+    const transaction: relationalStore.Transaction = await this.s().createTransaction();
+    try {
+      const removed: number = await transaction.delete(new relationalStore.RdbPredicates('subject')
+        .equalTo('id', subjectId).equalTo('timetableId', timetableId));
+      if (removed !== 1) {
+        throw new Error('Course no longer exists');
+      }
+      await transaction.delete(new relationalStore.RdbPredicates('events')
+        .equalTo('subjectId', subjectId).equalTo('timetableId', timetableId)
+        .equalTo('type', EasEventType.CLASS));
+      await transaction.commit();
+      ScheduleChangeSignal.notify();
+    } catch (e) {
+      try {
+        await transaction.rollback();
+      } catch (rollbackError) {
+        hilog.error(DOMAIN, TAG, 'rollback course delete failed %{public}s', String(rollbackError));
+      }
+      hilog.error(DOMAIN, TAG, 'delete course failed %{public}s', String(e));
+      throw new Error(String(e));
+    }
   }
 
   /** 删除科目。 */
@@ -435,12 +930,97 @@ export class RdbHelper {
   // 私有：行 → 模型
   // ------------------------------------------------------------------
 
+  /** A single database snapshot: read failures must never become an apparently empty backup. */
+  async createBackupSnapshot(): Promise<TimetableBackup[]> {
+    const tx = await this.s().createTransaction();
+    try {
+      const tables = RdbHelper.readRows(await tx.query(new relationalStore.RdbPredicates('timetable')
+        .orderByDesc('startTime')), RdbHelper.timetableMapper, true);
+      const result: TimetableBackup[] = [];
+      for (const table of tables) {
+        const item = new TimetableBackup();
+        item.timetable = table;
+        item.subjects = RdbHelper.readRows(await tx.query(new relationalStore.RdbPredicates('subject')
+          .equalTo('timetableId', table.id)), RdbHelper.subjectMapper, true);
+        item.events = RdbHelper.readRows(await tx.query(new relationalStore.RdbPredicates('events')
+          .equalTo('timetableId', table.id)), RdbHelper.eventMapper, true);
+        item.importBase = RdbHelper.readRows(await tx.query(new relationalStore.RdbPredicates('import_base')
+          .equalTo('timetableId', table.id)), (col: (name: string) => ValueGetter): EasImportBaseEntry =>
+          new EasImportBaseEntry(col('name').str(), col('fromTime').num(), col('toTime').num(),
+            col('signature').str()), true);
+        result.push(item);
+      }
+      await tx.commit();
+      return result;
+    } catch (error) {
+      await tx.rollback();
+      throw error as Error;
+    }
+  }
+
+  /** New IDs only. The receipt distinguishes committed restores from interrupted settings writes. */
+  async restoreBackup(items: TimetableBackup[], receipt: string, applySettings: () => Promise<void>): Promise<void> {
+    await this.writeTransaction(async (tx: relationalStore.Transaction): Promise<void> => {
+      for (const item of items) {
+        if (await tx.insert('timetable', RdbHelper.timetableValues(item.timetable)) < 0) throw new Error('Restore failed');
+        for (const subject of item.subjects) {
+          if (await tx.insert('subject', RdbHelper.subjectValues(subject)) < 0) throw new Error('Restore failed');
+        }
+        for (const event of item.events) {
+          if (await tx.insert('events', RdbHelper.eventValues(event)) < 0) throw new Error('Restore failed');
+        }
+        await RdbHelper.replaceImportBase(tx, item.timetable.id, item.importBase);
+      }
+      if (await tx.insert('backup_restore_receipt', { 'id': receipt }) < 0) throw new Error('Restore failed');
+      await applySettings();
+    });
+  }
+
+  async hasBackupReceipt(id: string): Promise<boolean> {
+    const rows = RdbHelper.readRows(await this.s().query(new relationalStore.RdbPredicates('backup_restore_receipt')
+      .equalTo('id', id)), (col: (name: string) => ValueGetter): string => col('id').str(), true);
+    return rows.length === 1;
+  }
+
+  private static timetableMapper(col: (name: string) => ValueGetter): EasTimetable {
+    const t: EasTimetable = new EasTimetable();
+    t.id = col('id').str();
+    t.name = col('name').str();
+    t.code = col('code').str();
+    t.startTime = col('startTime').num();
+    t.endTime = col('endTime').num();
+    t.createdAt = col('createdAt').num();
+    t.scheduleStructure = EasTimetable.decodeStructure(col('scheduleStructure').str());
+    return t;
+  }
+
+  private static subjectMapper(col: (name: string) => ValueGetter): EasTermSubject {
+    const s: EasTermSubject = new EasTermSubject();
+    s.id = col('id').str();
+    s.timetableId = col('timetableId').str();
+    s.name = col('name').str();
+    s.type = RdbHelper.subjectTypeOf(col('type').str());
+    s.field = col('field').str();
+    s.credit = col('credit').numD();
+    s.school = col('school').str();
+    s.countInSPA = col('countInSPA').num() !== 0;
+    s.code = col('code').str();
+    s.key = col('key').str();
+    s.createdAt = col('createdAt').num();
+    s.color = col('color').num();
+    return s;
+  }
+
   private static eventMapper(col: (name: string) => ValueGetter): EasEventItem {
     const e: EasEventItem = new EasEventItem();
     e.id = col('id').str();
     e.type = RdbHelper.eventTypeOf(col('type').str());
     e.name = col('name').str();
     e.place = col('place').str();
+    if (e.type === EasEventType.CLASS) {
+      // Also clean placeholders in courses imported by earlier app versions.
+      e.place = normalizeHtmlSpaces(e.place);
+    }
     e.teacher = col('teacher').str();
     e.subjectId = col('subjectId').str();
     e.timetableId = col('timetableId').str();
@@ -449,6 +1029,7 @@ export class RdbHelper {
     e.fromNumber = col('fromNumber').num();
     e.lastNumber = col('lastNumber').num();
     e.createdAt = col('createdAt').num();
+    e.color = col('color').num();
     return e;
   }
 
@@ -485,47 +1066,53 @@ export class RdbHelper {
   }
 
   private static readRows<T>(rs: relationalStore.ResultSet | null,
-    mapper: (col: (name: string) => ValueGetter) => T): T[] {
+    mapper: (col: (name: string) => ValueGetter) => T, strict: boolean = false): T[] {
     const out: T[] = [];
     if (rs === null || rs === undefined) {
+      if (strict) throw new Error('Database read failed');
       return out;
     }
     try {
       while (rs.goToNextRow()) {
         const col = (name: string): ValueGetter => {
-          return new ValueGetter(rs, name);
+          return new ValueGetter(rs, name, strict);
         };
         out.push(mapper(col));
       }
     } catch (e) {
+      if (strict) throw new Error('Database row read failed');
     } finally {
       try {
         rs.close();
       } catch (e) {
+        if (strict) throw new Error('Database close failed');
       }
     }
     return out;
   }
 
   private static firstRow<T>(rs: relationalStore.ResultSet | null,
-    mapper: (col: (name: string) => ValueGetter) => T): T | undefined {
+    mapper: (col: (name: string) => ValueGetter) => T, strict: boolean = false): T | undefined {
     if (rs === null || rs === undefined) {
+      if (strict) throw new Error('Database read failed');
       return undefined;
     }
     try {
       if (rs.goToNextRow()) {
         const col = (name: string): ValueGetter => {
-          return new ValueGetter(rs, name);
+          return new ValueGetter(rs, name, strict);
         };
         return mapper(col);
       }
       return undefined;
     } catch (e) {
+      if (strict) throw new Error('Database row read failed');
       return undefined;
     } finally {
       try {
         rs.close();
       } catch (e) {
+        if (strict) throw new Error('Database close failed');
       }
     }
   }
@@ -535,10 +1122,12 @@ export class RdbHelper {
 class ValueGetter {
   private rs: relationalStore.ResultSet;
   private name: string;
+  private strict: boolean;
 
-  constructor(rs: relationalStore.ResultSet, name: string) {
+  constructor(rs: relationalStore.ResultSet, name: string, strict: boolean = false) {
     this.rs = rs;
     this.name = name;
+    this.strict = strict;
   }
 
   str(): string {
@@ -547,6 +1136,7 @@ class ValueGetter {
       const v = this.rs.getString(idx);
       return v === undefined || v === null ? '' : v;
     } catch (e) {
+      if (this.strict) throw new Error('Database column read failed');
       return '';
     }
   }
@@ -557,6 +1147,7 @@ class ValueGetter {
       const v = this.rs.getLong(idx);
       return v === undefined || v === null ? 0 : Number(v);
     } catch (e) {
+      if (this.strict) throw new Error('Database column read failed');
       return 0;
     }
   }
@@ -568,6 +1159,7 @@ class ValueGetter {
       const v = this.rs.getDouble(idx);
       return v === undefined || v === null ? 0 : Number(v);
     } catch (e) {
+      if (this.strict) throw new Error('Database column read failed');
       return 0;
     }
   }

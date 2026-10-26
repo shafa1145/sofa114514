@@ -1,49 +1,257 @@
-# DEVICE-RUNBOOK — 编译 → 签名 → 装机 → M0 抓包 单一操作手册
+# 构建与设备验证
 
-> 适用：HitaNEXT（DevEco 26 / SDK API26）。当前 CLI 编译已通过（unsigned HAP）。
-> 环境变量：`NODE_HOME=C:\Program Files\nodejs`；`DEVECO_SDK_HOME=C:\Program Files\Huawei\DevEco Studio\sdk`
+## 构建
 
-## 1. 命令行编译（已通过，可随时重跑）
-```bat
-"C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat" --mode module -p product=default assembleHap --no-daemon
-:: 产物：entry\build\default\outputs\default\entry-default-unsigned.hap
-:: 注意：在项目根目录执行；若报 SDK/工具找不到，先设置上表环境变量。
+在 DevEco Studio 中打开仓库根目录，完成工程同步，并为本机配置签名。
+SDK 版本以根目录 `build-profile.json5` 为准。
+
+以下命令在仓库根目录执行，工具路径按本机安装位置调整：
+
+```powershell
+$env:NODE_HOME = 'C:\Program Files\nodejs'
+$env:DEVECO_SDK_HOME = 'C:\Program Files\Huawei\DevEco Studio\sdk'
+
+& 'C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat' `
+  --mode module -p product=default assembleHap --no-daemon
 ```
 
-## 2. 签名（在 DevEco Studio GUI 完成一次即可，材料会回写 build-profile）
-1. DevEco 打开 `C:\heyiwei\HitaNEXT`；
-2. File → Project Structure → Signing Configs → 勾选 **Automatically generate signature**（需登录华为账号/真机调试授权）；
-3. 保存后 `build-profile.json5` 会写入 `signingConfigs` 与产品 `signingConfig`；
-4. 此后命令行 `assembleHap` 会产出 **signed** HAP，或用 GUI Build → Build Hap(s)。
+配置签名后的调试包：
 
-## 3. 连接真机/模拟器
-- 真机：开启开发者模式 + USB 调试；确认 `hdc list targets` 显示设备。
-- 模拟器：DevEco Device Manager 启动 HarmonyOS 模拟器（登录校园网络）。
-
-## 4. 安装与首跑（真机）
-```bat
-hdc install -r <signed-hap路径>
-hdc shell aa start -a EntryAbility -b com.stupidtree.hitanext
+```text
+entry/build/default/outputs/default/entry-default-signed.hap
 ```
-预期路径：
-- Home 四 Tab 正常；
-- 「我的 → 网页登录（EAS）→ 深圳」弹出 ArkWeb 统一认证，输入校园账号走完登录；
-- 返回后「我的」显示会话（cookies/gen/webBaseUrl）；数据已落库（preferences，明文 JSON，加密为二期）。
 
-## 5. M0 抓包（深链路必需）
-1. 启动抓包代理（Charles/mitmproxy），设备或模拟器设代理并装根证书；
-2. 登录成功后进入 **成绩页 → 真实查询**（或教务系统内点成绩）；
-3. 先验证深圳学期、已选课程、课表 JSON、节次结构和成绩查询请求是否均返回 2xx；如字段变化，再按 `docs/eas-api-capture.md` 记录 URL/Method/Body/返回 JSON；
-4. 若接口字段变化，回填 `EasShenzhenEndpoints` 或对应解析器 → 重新编译装机验证「登录→课表/成绩」真链路。
+发布构建使用 `store` 产品及发布签名，与本地调试签名分开：
 
-## 6. 常见问题
-| 现象 | 处理 |
-|---|---|
-| install 失败 signature 错 | 未用 signed HAP（第 2 步后重打） |
-| 登录页空白/UA 异常 | 深圳 UA 双切换在真机验证（README 清单 3/4） |
-| http 明文被拦 | 网络策略按域放行（README 清单 5） |
-| 成绩请求失败 | 检查深圳网页登录 Cookie、校园网络和响应 JSON；本部/威海暂未接入同等数据链路 |
-| WebView Cookie 采集为空 | `fetchCookieSync` 域口径对照 `eas-cookie-finish-notes.md` B 节 |
+```powershell
+& 'C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat' `
+  --mode project -p product=store -p buildMode=release assembleApp --no-daemon
+```
 
-## 7. 之后（M2）
-威海/本部：configFor 已就位；本科本部走 EELAB token 流、威海走 webvpn；VPN 交换与端点以抓包回填（蓝本 §2.2.6 与笔记 D 节）。
+发布产物在 `build/outputs/store/`。不要提交本机签名材料、密码或构建产物。
+
+## 自动检查
+
+```powershell
+node scripts/static-checks.cjs
+$env:NODE_PATH = 'C:\Program Files\Huawei\DevEco Studio\plugins\codelinter\node_modules'
+node --test scripts/*.test.cjs
+```
+
+回归脚本依赖 TypeScript 转译器，示例使用 DevEco 自带版本。
+这些测试不替代 ArkTS 编译和设备验证。
+
+### 三校区通知（2026-10-11）
+
+- 功能中心 → 更多 → 资讯 → 通知使用最近一次成功登录时选择的校区；无保存校区时默认本部。刷新重新读取校区，加载更多沿用本次列表的校区。
+- 深圳使用信息网 `wbtreeid=1053`，`PAGENUM` 从 1 开始，不固定历史总页数；本部保留今日哈工大 `/category/10`；威海使用 `/1024/list.htm`，第二页为 `/1024/list2.htm`。博客继续订阅 HOA。
+- 深圳信息网在本次网络检查中跳转统一身份认证。页面会提示认证，并提供“打开通知网站”入口；在应用内网站完成认证后返回，通知列表重新加载，并只读取该通知网站的浏览器 Cookie。
+- 32 项资讯、入口和会话选择回归通过，静态检查通过。威海列表解析样例取自官网；深圳列表解析使用 VSB 模拟样例，尚未取得登录后的真实列表进行核对。
+- 设备待验：分别登录三校区后检查通知首屏、翻页、刷新和文章打开；深圳完成网站认证后返回，核对真实列表标题、发布日期和分页。
+
+## 设备回归
+
+- 今日、时间表、助手、资讯、更多可以正常切换。
+- 未登录且无课表时，今日不显示登录和课表管理按钮。
+- 更多保留正常业务入口，不显示本地搜索和开发样例入口。
+- 教务登录弹窗可以关闭；登录后会话状态正确更新。
+- 导入、选择课表后，今日与时间表显示同一份课表的数据。
+- 周切换、课程地点滚动、课程与考试详情正常。
+- 手动添加、编辑和删除课程或考试后，列表与时间表正确刷新。
+- 「更多 → 课表工具 → 导出至手机日历」导出当前课表；课表详情不显示日历导出按钮。
+- 首次允许日历权限后，系统日历出现「HITA · 课表名称」，课程日期、起止时间、地点及教师与课表一致；检查单双周、晚课和考试。
+- 重复导出、重新导入教务课表后再导出不会增加重复日程；修改时间或删除部分课程后再导出，旧日程更新，个人日程保留。
+- 拒绝日历权限、空课表、无效课程时间和中途写入失败均显示正确提示；重新授权或重试后可恢复导出。
+- 更多页面可以滚动到底，公告入口不会被底部导航栏挡住。
+
+设备未连接时只能完成构建及自动检查，应单独记录尚未完成的设备回归项。
+签名不一致导致覆盖安装失败时，先核对签名配置，不要为排查问题直接清除用户数据。
+
+
+## 空教室：安卓移植路径与验收
+
+参考版本为 HITA Android v3.0.0，提交 `a2989d6674b9ddf58ed301c46dd9e94bfd3ab4db`。对应源码：
+
+- `ui/eas/classroom/EmptyClassroomActivity.kt`：三项横向选择器、自动查询、双列教室卡片、状态判断。
+- `ui/eas/classroom/EmptyClassroomViewModel.kt`：当前学年筛选、当前学期选择、切换条件后查询。
+- `ui/eas/classroom/detail/EmptyClassroomDetailFragment.kt`：底部详情、七天切换、每节时间及占用状态。
+- `data/repository/TimetableRepository.kt`：从本地课表取得当前周；无对应课表时第 1 周。
+- `data/repository/EASRepository.kt`：先缓存后网络、保留失败前的缓存、180 天清理。
+- `data/source/web/eas/{EASWebSource,BenbuEASWebSource,WeihaiEASWebSource,ShenzhenWebAcademicParser,BenbuClassroomParser}.kt`：三校区查询和解析。
+
+### 鸿蒙实现路径
+
+`Home.ets → EmptyClassroomPage.ets → EmptyClassroomService.ets → EasApiClient → EmptyClassroomData.ets → EmptyClassroomDisplay.ets → 页面／底部详情`。
+
+文件均在 `entry/src/main/ets` 内：
+
+1. `pages/Home.ets` 和 `resources/base/profile/main_pages.json` 保留已有入口与路由登记。
+2. `pages/EmptyClassroomPage.ets` 复用 `EasSessionStore.loadPreferred()` 读取账号，`EasDataProvider` 读取学期、深圳作息，`RdbHelper` 读取对应校区本地课表周次。选择教学楼／学期／周次即查询；周次选择 1～20；点击卡片显示底部节次表。请求代数保证旧响应不能覆盖新条件或已退出页面。
+3. `feature/eas/classroom/EmptyClassroomService.ets` 复用现有带 Cookie 的客户端。深圳使用 `/pksd/queryjxlList`、`/cdkb/querycdzyleftzhou`、`/cdkb/querycdzyrightzhou`，34 位周掩码与安卓相同，并完整读取教室分页。本部／威海使用 `/kjscx/queryJxlListBySjid`、`/kjscx/queryKjs`；本部 `pageXiaoqu` 为空，威海带 WebVPN 参数并适配区域、楼号前导零和两种空教室选择器值。
+4. `EmptyClassroomData.ets` 解析深圳 JSON，合并教室与占用数据；本部／威海选最宽的 `dataTable`，末尾 42 格映射为七天、每天六组双节课。
+5. `EmptyClassroomDisplay.ets` 对应安卓状态、学期格式、详情行。卡片依据所选周、今天星期和当前节次，显示空闲／被占／将占／未知；详情使用校区作息，显示每节时间。
+6. `EmptyClassroomCache.ets` 使用独立 Preferences 保存查询快照，按账号、校区、学期、区域、楼号、周次隔离，不保存登录凭据；先缓存后网络，成功空结果也替换旧缓存，过期快照在写入时清理。
+
+平台适配与明确差异：选择器、网格、底部弹层用 ArkUI，沿用鸿蒙主题与账号入口；失败提示和缓存时间可见。威海不沿用安卓的“空楼号查询所有楼”兜底，以免把其他楼的结果显示在所选楼下。无法识别的占用数据返回错误或未知，不当作空闲。深圳 Web 作息失败时不猜测时间。没有新加校区切换条、名称搜索、节次范围或“仅空闲”筛选。
+
+### 自动检查
+
+在仓库目录运行，按本机 DevEco 路径配置 Node 和 TypeScript：
+
+```powershell
+$env:NODE_PATH = 'D:\HITA Harmony\DevEco Studio\plugins\codelinter\node_modules'
+& 'D:\HITA Harmony\DevEco Studio\tools\node\node.exe' --test scripts/empty-classroom.test.cjs scripts/production-surface.test.cjs
+```
+
+然后执行项目静态检查：
+
+```powershell
+& 'D:\HITA Harmony\DevEco Studio\tools\node\node.exe' scripts/static-checks.cjs
+```
+
+构建使用本手册前文的 `assembleHap` 步骤或 DevEco 运行按钮。测试执行实际解析、接口参数、页面异步逻辑和缓存逻辑，响应来自合成数据；不代表真实教务接口已验收。
+
+### 用户检查方式
+
+对本部、威海、深圳分别使用对应本科账号，并与安卓 3.0.0／学校教务网站的同一学期、教学楼、周次对照：
+
+- 入口：从「更多 → 空教室」进入；顶部只有教学楼／学期／周次三项选择；有数据时显示双列教室卡片。
+- 默认项：当前学期、第一栋楼；已导入同校区同学期课表时周次对应当前周，否则第 1 周。
+- 自动查询：分别换楼、换学期、换周，观察加载和结果变化；快速换周时旧请求返回不能覆盖新周。重复选择同一条件不重复请求。
+- 状态：核对被占、下一节将占、空闲；详情默认今天，切换周一／周日，核对每节时间、借用和课程占用。旧表格一格占用必须对应两节。
+- 详情：确认底部弹层可以滚动到底、切换星期、关闭并打开另一间教室；返回键行为正常；核对深色／浅色、长教室名和文字缩放。
+- 缓存：同条件查询成功后断网重试，显示缓存时间及更新失败；换楼或换周不能显示上一条件的缓存。恢复网络查询成功后缓存标记消失，成功空结果不保留旧教室。
+- 账号与错误：未登录／过期会话／断网／格式异常须提示错误；登录后返回可重新加载，不能变成“整楼空闲”。切换校区由「更多」中的教务账号完成。
+
+2026-10-10 开发验证：50 项专项和入口回归测试通过，静态检查 70 文件／13 路由通过，ArkTS 编译及调试签名通过。最终调试包已覆盖安装到 HarmonyOS 7 / API 26 模拟器并从真实「更多」入口打开。
+
+深圳实际会话的学期接口现已返回 HTTP 200；已显示 2026–2027 秋季第 6 周 A 楼教室列表。打开 A103，周一显示占用，切回周六显示空闲，能滚动到第 12 节（21:40–22:30）；切换第 7 周自动重新查询，教学楼选择器能切换 F 楼。缓存先显示、网络完成后清除缓存标记的流程已观察。实际检查发现并修正了 ArkUI 构建器初始文字未刷新、详情列表复用上一星期文字的问题。
+
+这些结果证明深圳查询及页面操作已运行，不代表已逐项对照学校网页核实占用准确性。本部、威海只有解析与请求参数测试，仍需对应账号验收；浅色、文字缩放、过期会话恢复也留在人工检查项中。此前 HTTP 405 未在本轮复现。未修改本地签名设置或清除课表数据，未提交或推送代码。
+
+## 调色面板：实现路径与验收
+
+### 本次变更
+
+- 时间表右上角调色盘改为独立底部弹窗，调整标题、日期和时间刻度的文字颜色，保留原快捷色。
+- 点击课程后，详情右上角新增调色盘；按科目 ID 和课表 ID 保存颜色，同一课程所有周次的课块一起更新，不改变当前查看周次。
+- 两个入口共用彩虹色相条、可点选和拖动的饱和度／亮度面板、快捷色、预览、保存与取消。
+- 保留课块亮色压暗规则；文字预览沿用现有深色模式默认色适配规则。
+- 调色面板独立识别拖动手势，避免上下选色时带动底部弹窗；圆形选点使用双层圆形描边，避免矩形阴影。
+- 保存失败显示错误；关闭弹窗期间禁止重复打开，迟到的文字颜色保存回调不会关闭后续弹窗。
+
+### 实现路径
+
+`Home.ets → CourseColorEditor.ets → CourseColorModel.ets` 负责入口、选择与预览。
+课程颜色通过 `RdbHelper.saveCourseColor` 更新本地科目记录；文字颜色通过 `TimetableSelectionStore.saveTextColor` 保存本地偏好。未新增依赖或数据库表。
+
+### 用户检查方式
+
+- 文字调色：打开时间表右上角调色盘，拖动色相条、点击或上下拖动颜色区域，检查文字预览；保存后标题、日期和时间刻度更新。
+- 课程调色：点击课程、打开详情调色盘，保存新颜色；检查同一课程其他课次及其他周次一致变色，其他课程不变，当前周次不跳转。
+- 取消与保留：修改颜色后取消，再次打开仍为原色；保存后重新打开及重启应用，颜色保留。
+- 手势与外观：上下拖动圆形选点时弹窗位置保持稳定，圆圈四周没有方框；仍可通过取消或正常关闭方式退出。
+- 连续操作：弹窗关闭动画期间快速点击入口、调色保存期间关闭或切换页面，不应闪回旧弹窗或误关新弹窗。
+- 兼容性：继续核对浅色模式、字体放大、真机触摸与 API 23 设备。自动检查不替代这些设备验收。
+
+### 本次检查记录（2026-10-10）
+
+空教室与调色功能的提交前检查：全库 296 项回归测试全部通过，静态检查 72 文件／13 路由通过；ArkTS 编译和本地调试签名通过。更新了仍依赖旧固定色板的回归断言，并新增调色弹窗关闭状态测试。
+
+HarmonyOS 7 / API 26 模拟器已检查两个调色入口、面板拖动、取消、颜色保存读回，以及课程颜色重启后保留；拖动过程中截图核对弹窗位置与圆形描边。测试颜色已取消或恢复。
+
+本部、威海空教室查询仍需对应本科账号验收；深圳已完成前节记录的运行检查，但未逐项对照学校网页确认占用准确性。浅色模式、大字体、真机触摸和 API 23 实际设备仍待补验。
+
+## 本部、威海本科考试查询（2026-10-11）
+
+- 对照 Android 的 `BenbuEASWebSource.getExamItems`、`WeihaiEASWebSource.getExamItems`，
+  以及本地 Aura 参考中的 `AcademicWebVPNResources.loadExams`、`AcademicWebExamParser`。
+  Aura 原仓库地址本轮返回 404，因此 iOS 依据为已有本地源码，未宣称与最新远端一致。
+- 本部使用 `/kscx/queryKcForXs1`，威海使用 `/kscx/queryKcForXs`；
+  参数 `xnxq` 来自实际学期，`kssjd=01/02/03` 分别查询期末、期中、补考。
+  本部沿用安卓 GET，明确返回 405 时改用 Aura 的表单 POST；威海使用表单 POST 和 WebVPN Origin/Referer。
+- 考试页沿用 `loadPreferred()` 选择最近登录的会话，优先使用考试页面选中的学期。
+  未返回考试学期选项或页面只接受 POST 时，回退现有学期读取逻辑；不硬编码学年。
+- 根据表头解析课程、考场与具体时间，处理 HTML 空格和日期格式。
+  合法空表可返回无考试；格式异常、网络故障、会话过期均不能当作空表。
+  部分类别失败保留已获取的考试并标明失败类别；会话过期立即停止查询。
+- 保留既有点击详情及导入当前课表的操作。未公布完整起止时间或日期无效时只展示原文，
+  不创建默认 09:00 的事件。离开页面后旧查询结果不能覆盖后续查询。
+
+自动回归运行实际解析器、请求层和页面逻辑，覆盖接口地址、参数、Cookie、不同请求方式、
+三类考试合并、重复行、错误和空表的区别、当前学期选择、查询取消及导入。
+响应为合成数据；本部、威海真实账号仍需在「更多 → 考试查询 → 查询」与学校网页核对。
+本轮未改变最低 API、数据库结构或签名配置。
+
+## API 26 沉浸材质与资讯悬浮栏（2026-10-11）
+
+- 参考华为沉浸光感教程，使用原生标题栏承载普通控件的沉浸材质。今日蓝色面板、时间表工具、更多二级页返回及指定操作按钮、课表管理操作和教务认证校区栏接入材质与触摸光效。
+- 控件与分段栏关闭材质阴影；今日蓝色面板保留蓝色半透明色调。课表管理 API 26 导出按钮使用固定 44vp 圆形容器，图标单独居中。
+- API 26 资讯 dock 保持原先的全宽及左右各 16vp 留白，独立悬浮在列表上，不再在 dock 下方绘制白色渐隐遮罩。
+- 系统自动标题栏模糊未在真机上生效后，改为对列表容器直接使用渐变模糊。根据过渡更平缓的反馈，过渡区从 28vp 扩为 52vp，模糊半径从 24 降为 20，并以多个采样点平缓衔接两端；仍在 dock 顶部结束。标题与 dock 是独立清晰图层，不参与列表模糊。
+- 新材质与资讯布局仅在 API 26 及以上加载。API 23–25 使用原有标题、分段栏、渐隐遮罩及课表管理导出图标；未修改最低 API 或用户数据。
+
+验证记录：ArkTS 编译和调试签名成功，345 项自动测试通过，静态检查 77 文件／13 路由通过。
+当前目录没有 Git 元数据，依赖 Git 索引的 repository-hygiene 测试未运行。
+已覆盖安装至 API 26 手机及 API 23 模拟器；API 23 启动、认证弹窗和课表管理旧控件分支已检查。
+API 26 课表管理按钮与图标几何中心一致；资讯全宽 dock 位置在滚动前后固定，列表内容可滚到其下方。
+最终直接渐变模糊版本已安装，但真机视觉强度、动态触摸光效和深色／大字体仍需人工核对，不能以源码断言替代视觉验收。
+
+### 资讯分段按钮规范适配
+
+参考[华为分段按钮设计规范](https://developer.huawei.com/consumer/cn/doc/doccenter-ux-design/segmentbutton-0000001929853292)，
+API 26 资讯顶部改用原生 TabSegmentButtonV2：博客／通知作为同级页签，保留点击、原生拖拽和状态动画。
+沉浸材质仅应用到整体背板；选中块使用约 12% 不透明度的主题色，浅色为黑、深色为白，距背板 4vp。
+显式关闭选中块默认阴影，并复用无阴影、带触摸光效的沉浸材质。宽度按用户要求保持原全宽及左右 16vp 留白，未采用规范的大屏 448vp 上限。
+原有渐变模糊、dock 悬浮位置及 API 23–25 分支保持不变。
+
+本次编译、签名及 348 项回归测试通过；静态检查 78 文件／13 路由通过。依赖 Git 索引的测试仍因目录无 Git 元数据而未运行。
+已覆盖安装 API 26 真机和 API 23 模拟器，API 23 可启动。API 26 真机确认点击通知后内容切换、等宽布局、文字居中，
+选中块实际背景为 #1F000000，选中状态随分类同步更新。拖拽检查期间页面被切换，未确认真机拖拽与跟手动画；深色和大字体视觉仍待核对。
+
+## API 26 半模态与课程操作材质（2026-10-11）
+
+参考[华为半模态面板规范](https://developer.huawei.com/consumer/cn/doc/doccenter-ux-design/bindsheet-0000001956852753)。
+本轮新增效果严格限定 API 26：同时检查 26 可用、27 不可用及沉浸材质能力；其他 API 保留此前效果。
+API 26 模块使用延迟导入，不在 API 23–25 或 27 及以上设备求值。本轮未改变前一批功能的版本范围。
+
+- Home 共用半模态的课程详情、课程调色、教务认证／网页登录、时间表文字调色接入 SheetOptions.systemMaterial。
+  使用 THICK 材质及白色触摸光效，不启用内容反色；原高度、遮罩、拖动与关闭生命周期保持不变。
+  日历导出确认面板、课表详情页自身的课程编辑面板未纳入此次改动。
+- 课程详情调色按钮、课程调色的取消／保存、课表详情添加课程、更多中的三种深色模式选项使用带光效的控件材质。
+  所有新增控件材质均关闭 applyShadow；原有选色预览和色板保留准确的颜色。
+- 普通控件通过透明的原生标题区承载材质。调色按钮固定为 44vp 圆形；添加课程只包裹按钮，
+  不限制课表名称区域高度。其他 API 仍显示原添加课程控件与调色面板底部按钮。
+- 教务认证内部两处卡片使用约 55% 不透明度的浅／深色背景；网页登录容器不再用实色遮挡材质，
+  官方网页及验证码仍保持原渲染方式。考试页独立调色器和文字调色器的底部按钮未额外启用材质。
+
+本轮 ArkTS 编译及调试签名成功；359 项自动回归测试通过，静态检查 80 文件／13 路由通过。
+新增测试覆盖精确版本隔离、能力不足回退、原有面板选项／回调保留、控件禁用分支、作用范围与颜色预览保护。
+目录没有 Git 元数据，依赖 Git 索引的 repository-hygiene 测试未运行；未提交或推送。
+
+最终包已保留数据覆盖安装至 API 23 模拟器。UI 树和实际点击确认启动、文字调色打开／取消、
+教务认证打开、官方网页登录打开／返回；旧版文字调色仍保留原背景及蓝色取消／保存按钮。
+模拟器没有课程数据，因此未以创建测试课表的方式验证课程调色与添加课程。
+用户要求暂时不要操作手机，本轮未安装或操作 API 26 手机。API 26 的动态光感、无阴影视觉、
+按钮对齐、颜色保存读回、深色及大字体仍需后续真机检查；自动测试不能替代这些视觉验收。
+
+### 日历导出确认面板补充
+
+根据后续要求，将「导出至手机日历」确认面板加入相同的 API 26 沉浸光感范围。
+仅扩展 Home 共用面板的材质启用条件；保留原面板高度、遮罩、拖拽关闭、取消及确认按钮，
+不改变确认后才请求权限和写入日历的流程。其他 API 仍使用原有面板效果。
+
+ArkTS 编译和签名通过；360 项自动回归测试及静态检查（80 文件／13 路由）通过。
+仍未运行依赖 Git 索引的 repository-hygiene 测试。本次未覆盖安装或操作手机，未执行实际日历写入；
+API 26 真机光效仍待验收。
+
+### 今日安排日程卡片补充
+
+用户确认“今日安排的栏目”指标题下方每条课程／日程卡片，不包括标题栏和空状态。
+仅在 API 26 且设备支持材质时，为这些卡片设置无阴影、可交互、带白色触摸光效的新材质；
+API 23–25 和 27 及以上继续显示原有实体卡片。卡片高度从实际内容测量，随地点、老师、
+课程状态和字体变化同步调整材质层，不以固定高度裁切内容。文字、时间轴、考试标签、
+进行中边框及进度条保留原色，内容层透传触摸到材质，同时不阻断列表滚动。
+
+ArkTS 编译和签名通过；364 项自动回归测试及静态检查（81 文件／13 路由）通过。
+本次没有在 API 26 真机上安装或操作，动态光效、实际滚动手感和大字体视觉仍需设备验收。

@@ -198,6 +198,24 @@ export class EasTimetable {
     return res;
   }
 
+  /** 本部本科作息，与安卓端 CampusDefaultSchedule 的本部表一致。 */
+  static getBenbuTimeStructure(): EasTimePeriodInDay[] {
+    return [
+      EasTimePeriodInDay.ofHour(8, 0, 8, 50),
+      EasTimePeriodInDay.ofHour(8, 55, 9, 45),
+      EasTimePeriodInDay.ofHour(10, 0, 10, 50),
+      EasTimePeriodInDay.ofHour(10, 55, 11, 45),
+      EasTimePeriodInDay.ofHour(13, 45, 14, 35),
+      EasTimePeriodInDay.ofHour(14, 40, 15, 30),
+      EasTimePeriodInDay.ofHour(15, 45, 16, 35),
+      EasTimePeriodInDay.ofHour(16, 40, 17, 30),
+      EasTimePeriodInDay.ofHour(18, 30, 19, 20),
+      EasTimePeriodInDay.ofHour(19, 25, 20, 15),
+      EasTimePeriodInDay.ofHour(20, 30, 21, 20),
+      EasTimePeriodInDay.ofHour(21, 25, 22, 15)
+    ];
+  }
+
   /** 威海校区作息（与安卓端 WeihaiEASWebSource 保持一致）。 */
   static getWeihaiTimeStructure(): EasTimePeriodInDay[] {
     const res: EasTimePeriodInDay[] = [];
@@ -291,7 +309,22 @@ export class EasTermSubject {
   }
 }
 
-/** 事件/课程实例（EventItem.kt 直迁；color 不落库）。 */
+/** 事件/课程实例（EventItem.kt 直迁）。 */
+/** 上次导入或更新时教务端的一节课：名称与起止时间定位课次，signature 记录会单独变化的字段。 */
+export class EasImportBaseEntry {
+  name: string = '';
+  from: number = 0;
+  to: number = 0;
+  signature: string = '';
+
+  constructor(name: string, from: number, to: number, signature: string) {
+    this.name = name;
+    this.from = from;
+    this.to = to;
+    this.signature = signature;
+  }
+}
+
 export class EasEventItem {
   id: string = newId();
   type: EasEventType = EasEventType.CLASS;
@@ -305,7 +338,7 @@ export class EasEventItem {
   fromNumber: number = 0;
   lastNumber: number = 0;
   createdAt: number = Date.now();
-  /** 科目颜色（UI 层填充，不落库）。 */
+  /** 课程颜色由科目填充；考试颜色按事件保存，0 表示使用默认颜色。 */
   color: number = 0;
 
   static getTagInstance(name: string): EasEventItem {

@@ -1,10 +1,6 @@
 {
-  "modelVersion": "26.0.0",
-  "name": "entry",
-  "version": "1.0.0",
-  "description": "HitaNEXT entry module (HITA port)",
-  "main": "",
-  "author": "",
-  "license": "",
-  "dependencies": {}
+  "modelVersion": "5.0.0",
+  "description": "HITA NEXT HarmonyOS client",
+  "dependencies": {},
+  "devDependencies": {}
 }

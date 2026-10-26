@@ -2,6 +2,7 @@
 /oh_modules
 /local.properties
 /.idea
+/.codex/
 **/build
 /.hvigor
 /.appanalyzer
@@ -16,4 +17,17 @@
 /.test
 /.test_web
 
-.codegenie
+# Local legal documents and signing materials
+/docs/legal/
+/signing/
+*.p12
+*.p7b
+*.cer
+*.csr
+*.pwd
+*.hap
+
+# Local reference downloads and reverse-engineering workspace
+/scratch/
+/.analysis/
+/HITA_Android_src/

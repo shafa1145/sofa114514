@@ -1,27 +1,14 @@
 /**
  * EasWebLoginProbe.ets — URL/页面/会话判定谓词集（纯函数，与平台无关，可单测回归）。
  *
- * 出处（行为逐字还原；行号 = WebViewLoginActivity.java / 各 *.java 反编译）：
- *  - WebLoginSuccessPolicy.java：isShenzhenAuthenticatedPage / isWeihaiAuthenticatedPage /
- *    shenzhenCookieProbeUrls / shenzhenWebBaseUrl
- *  - EASToken$Companion.java：hasShenzhenWebSessionCookies
- *  - ShenzhenWebAutoLogin.java：isProxyRoot / reauthenticationUrl / normalizeStudentType
- *  - WebViewLoginActivity.java：
- *    hasRequiredCookies L2339-2426 / hasUrlJsession L2428-2446 / hasWeihaiVpnTicket L2452-2489 /
- *    parseCookies L3483-3592 / extractJsessionidFromUrl L1488-1512 /
- *    isSuccessPage L2845-3013 / isJwtsPage L2689-2759 / isPortalHomePage L2771-2837 /
- *    isTrustPortalPage L3015-3033 / isMfaPage L2761-2769 / isShenzhenProxyJwPage L2839-2843
- *
- * 整理笔记：docs/eas-cookie-finish-notes.md（§0-13、§A-C）、docs/eas-page-predicate-notes.md
+ * 判定规则参考 HITA Android 的 WebLoginSuccessPolicy、ShenzhenWebAutoLogin
+ * 和 WebViewLoginActivity，并适配鸿蒙端的 Cookie 采集流程。
  */
 import { EasCampus } from '../EasSession';
 import { EasCampusUrls } from './EasWebLoginConfig';
 
 /** 威海 webvpn ticket Cookie key 前缀（WEIHAI_TICKET_COOKIE_PREFIX，L234）。 */
 export const WEIHAI_TICKET_COOKIE_PREFIX: string = 'wengine_vpn_ticket';
-
-/** 已认证成功页触发判定用常量：本部数据路径特征段（isSuccessPage BENBU）。 */
-const BENBU_DATA_PATH_HINTS: string[] = ['kbcx', 'cjcx', 'kjscx', 'xswh', 'query', 'index'];
 
 // ---------------------------------------------------------------------------
 // URL 基础工具（ArkTS 无 java.net.URI；手写 host/path 提取）
@@ -86,7 +73,7 @@ function equalsIgnoreCase(a: string, b: string): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * 深圳 Web 会话成立（EASToken$Companion L28-63 逐字语义，**修正蓝本表述**）：
+ * 深圳 Web 会话成立：
  * `(!js.isBlank() && !route.isBlank()) || !session.isBlank()`
  * —— 直连会话需要 JSESSIONID + route；代理会话可由非空 SESSION 单独成立。
  */
@@ -256,15 +243,17 @@ export function isShenzhenAuthenticatedPage(url: string, cookies: Map<string, st
 /**
  * 威海成功页（L164-317）：path 含 /http/ 或 kbcx|cjcx|kjscx|query|index（成功路径集合），
  * 且非登录页（logincas、endsWith /login、/login/），且含 wengine_vpn_ticket* key 且 JSESSIONID 非空。
- * ⚠️ 该文件 CFR 控制流存在多义（真机校准项，见笔记 D）。
  */
 export function isWeihaiAuthenticatedPage(url: string, cookies: Map<string, string>): boolean {
+  if (hostOf(url) !== 'webvpn.hitwh.edu.cn') {
+    return false;
+  }
   const path: string = pathOf(url);
   const pathOk: boolean = path.indexOf('/http/') >= 0 || path.indexOf('kbcx') >= 0 ||
     path.indexOf('cjcx') >= 0 || path.indexOf('kjscx') >= 0 || path.indexOf('query') >= 0 ||
     path.indexOf('index') >= 0;
   const loginish: boolean = path.indexOf('logincas') >= 0 || path.endsWith('/login') ||
-    path.indexOf('/login/') >= 0;
+    path.indexOf('/login/') >= 0 || path.indexOf('authserver') >= 0 || path.indexOf('reauth') >= 0;
   if (!pathOk || loginish) {
     return false;
   }
@@ -283,6 +272,29 @@ export function isAuthenticationPage(url: string): boolean {
 /** isMfaPage L2761-2769：path 含 "/authserver/reAuthCheck/"（忽略大小写）。 */
 export function isMfaPage(url: string): boolean {
   return containsIgnoreCase(pathOf(url), '/authserver/reauthcheck/');
+}
+
+/** 静默续期停在这些页面即放弃：需要用户输入账号密码或完成二次认证。 */
+export function isCredentialPromptPage(url: string): boolean {
+  return isAuthenticationPage(url) || isMfaPage(url);
+}
+
+/**
+ * 静默续期不把这些页面上的登录表单当作需要用户介入：深圳教务入口自带本地账号表单，
+ * 控制器会点击“统一身份认证登录”；本部实验教学与电子实验系统只是登录后的可选会话。
+ */
+export function ignoresLoginFormDuringRenewal(url: string): boolean {
+  const host: string = hostOf(url);
+  return host === hostOf(EasCampusUrls.SHENZHEN_DIRECT_BASE) || isShenzhenProxyJwPage(url) ||
+    host === hostOf(EasCampusUrls.SJJX_BASE) || host === hostOf(EasCampusUrls.EELABINFO_URL);
+}
+
+/** Only the configured EAS host may supply a Benbu session, not CAS or a portal. */
+export function isBenbuEasPage(url: string, studentType: string): boolean {
+  const base: string = studentType === '2' ? EasCampusUrls.GRADUATE_BASE : EasCampusUrls.JWTS_BASE;
+  const path: string = pathOf(url);
+  return hostOf(url) === hostOf(base) && path.indexOf('authserver') < 0 &&
+    path.indexOf('reauth') < 0 && path.indexOf('logout') < 0;
 }
 
 /** isShenzhenProxyJwPage L2839-2843：host == jw-hitsz-edu-cn.hitsz.edu.cn（忽略大小写）。 */
@@ -408,37 +420,28 @@ export enum EasPageKind {
  * 成功页判定（isSuccessPage L2845-3013）：
  *  - SHENZHEN：isShenzhenAuthenticatedPage(url, cookies)
  *  - WEIHAI：isWeihaiAuthenticatedPage(url, cookies)
- *  - BENBU 研究生：host 含 yjsgl 且 path 含 /xs/index 且 hasRequiredCookiesFor
- *  - BENBU 本科：(host 含 jwts 且 path 不含 login 且 map 含 JSESSIONID 与 HIT) 或
- *              ((host 含 jwts 或含 hit.edu.cn) 且 path 含 数据特征段之一)
+ *  - BENBU：仅接受对应培养层次的教务域名；本科仍需由控制器验证课表接口。
  */
 export function isSuccessPageFor(url: string, cookies: Map<string, string>, campus: EasCampus,
   studentType: string): boolean {
+  if (isAuthenticationPage(url) || isMfaPage(url)) {
+    return false;
+  }
   if (campus === EasCampus.SHENZHEN) {
     return isShenzhenAuthenticatedPage(url, cookies);
   }
   if (campus === EasCampus.WEIHAI) {
     return isWeihaiAuthenticatedPage(url, cookies);
   }
-  const host: string = hostOf(url);
+  if (!isBenbuEasPage(url, studentType)) {
+    return false;
+  }
   const path: string = pathOf(url);
   if (studentType === '2') {
-    return host.indexOf('yjsgl') >= 0 && path.indexOf('/xs/index') >= 0 &&
+    return path.indexOf('/xs/index') >= 0 &&
       hasRequiredCookiesFor(cookies, url, campus, studentType);
   }
-  const condA: boolean = host.indexOf('jwts') >= 0 && path.indexOf('login') < 0 &&
-    cookies.has('JSESSIONID') && cookies.has('HIT');
-  let condB: boolean = host.indexOf('jwts') >= 0 || host.indexOf('hit.edu.cn') >= 0;
-  if (condB) {
-    condB = false;
-    for (let i = 0; i < BENBU_DATA_PATH_HINTS.length; i++) {
-      if (path.indexOf(BENBU_DATA_PATH_HINTS[i]) >= 0) {
-        condB = true;
-        break;
-      }
-    }
-  }
-  return condA || condB;
+  return path.indexOf('login') < 0 && hasRequiredCookiesFor(cookies, url, campus, studentType);
 }
 
 /** 综合页面归类（优先级：MFA > SUCCESS > 门户/中转细类 > UNKNOWN）。 */
